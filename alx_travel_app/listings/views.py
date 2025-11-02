@@ -3,20 +3,80 @@ import requests
 from django.http import JsonResponse
 from django.views.decorators.csrf import csrf_exempt
 from django.conf import settings
-from .models import Payment
-from django.core.mail import send_mail
 from django.utils import timezone
+from rest_framework import viewsets, status
+from rest_framework.response import Response
+from rest_framework.decorators import action
+
+from .models import Booking, Payment
+from .serializers import BookingSerializer, PaymentSerializer
+from .tasks import send_booking_confirmation_email
 
 CHAPA_SECRET_KEY = os.getenv('CHAPA_SECRET_KEY', 'your_chapa_secret_key_here')
 CHAPA_BASE_URL = 'https://api.chapa.co/v1/transaction'
 
-@csrf_exempt
-def initiate_payment(request):
-    if request.method == 'POST':
-        data = request.POST
-        booking_reference = data.get('booking_reference')
-        amount = data.get('amount')
-        email = data.get('email')
+
+class BookingViewSet(viewsets.ModelViewSet):
+    """
+    ViewSet for managing bookings.
+    Automatically triggers email notification upon booking creation.
+    """
+    queryset = Booking.objects.all()
+    serializer_class = BookingSerializer
+
+    def create(self, request, *args, **kwargs):
+        """
+        Create a new booking and trigger email notification asynchronously.
+        """
+        serializer = self.get_serializer(data=request.data)
+        serializer.is_valid(raise_exception=True)
+        self.perform_create(serializer)
+
+        # Get the created booking instance
+        booking = serializer.instance
+
+        # Prepare booking data for the email task
+        booking_data = {
+            'user_email': booking.user_email,
+            'booking_reference': booking.booking_reference,
+            'property_name': booking.property_name,
+            'check_in_date': str(booking.check_in_date),
+            'check_out_date': str(booking.check_out_date),
+            'total_price': str(booking.total_price),
+        }
+
+        # Trigger the email task asynchronously using Celery
+        send_booking_confirmation_email.delay(booking_data)
+
+        headers = self.get_success_headers(serializer.data)
+        return Response(
+            {
+                'message': 'Booking created successfully. Confirmation email will be sent shortly.',
+                'booking': serializer.data
+            },
+            status=status.HTTP_201_CREATED,
+            headers=headers
+        )
+
+
+class PaymentViewSet(viewsets.ModelViewSet):
+    """ViewSet for managing payments."""
+    queryset = Payment.objects.all()
+    serializer_class = PaymentSerializer
+
+    @action(detail=False, methods=['post'])
+    def initiate(self, request):
+        """Initiate payment via Chapa API."""
+        booking_reference = request.data.get('booking_reference')
+        amount = request.data.get('amount')
+        email = request.data.get('email')
+
+        if not all([booking_reference, amount, email]):
+            return Response(
+                {'error': 'booking_reference, amount, and email are required'},
+                status=status.HTTP_400_BAD_REQUEST
+            )
+
         payload = {
             'amount': amount,
             'currency': 'ETB',
@@ -25,47 +85,74 @@ def initiate_payment(request):
             'callback_url': 'https://yourdomain.com/payment/verify/'
         }
         headers = {'Authorization': f'Bearer {CHAPA_SECRET_KEY}'}
-        response = requests.post(f'{CHAPA_BASE_URL}/initialize', json=payload, headers=headers)
-        resp_data = response.json()
-        if resp_data.get('status') == 'success':
-            transaction_id = resp_data['data']['tx_ref']
-            payment = Payment.objects.create(
-                booking_reference=booking_reference,
-                amount=amount,
-                transaction_id=transaction_id,
-                status='Pending'
-            )
-            return JsonResponse({'checkout_url': resp_data['data']['checkout_url'], 'payment_id': payment.id})
-        return JsonResponse({'error': resp_data.get('message', 'Payment initiation failed')}, status=400)
-    return JsonResponse({'error': 'Invalid request method'}, status=405)
 
-@csrf_exempt
-def verify_payment(request):
-    if request.method == 'POST':
-        payment_id = request.POST.get('payment_id')
+        try:
+            response = requests.post(f'{CHAPA_BASE_URL}/initialize', json=payload, headers=headers)
+            resp_data = response.json()
+
+            if resp_data.get('status') == 'success':
+                transaction_id = resp_data['data']['tx_ref']
+                payment = Payment.objects.create(
+                    booking_reference=booking_reference,
+                    amount=amount,
+                    transaction_id=transaction_id,
+                    status='Pending'
+                )
+                return Response({
+                    'checkout_url': resp_data['data']['checkout_url'],
+                    'payment_id': payment.id
+                }, status=status.HTTP_200_OK)
+
+            return Response(
+                {'error': resp_data.get('message', 'Payment initiation failed')},
+                status=status.HTTP_400_BAD_REQUEST
+            )
+        except Exception as e:
+            return Response(
+                {'error': f'Payment initiation failed: {str(e)}'},
+                status=status.HTTP_500_INTERNAL_SERVER_ERROR
+            )
+
+    @action(detail=False, methods=['post'])
+    def verify(self, request):
+        """Verify payment status via Chapa API."""
+        payment_id = request.data.get('payment_id')
+
+        if not payment_id:
+            return Response(
+                {'error': 'payment_id is required'},
+                status=status.HTTP_400_BAD_REQUEST
+            )
+
         try:
             payment = Payment.objects.get(id=payment_id)
         except Payment.DoesNotExist:
-            return JsonResponse({'error': 'Payment not found'}, status=404)
-        headers = {'Authorization': f'Bearer {CHAPA_SECRET_KEY}'}
-        response = requests.get(f'{CHAPA_BASE_URL}/verify/{payment.transaction_id}', headers=headers)
-        resp_data = response.json()
-        if resp_data.get('status') == 'success' and resp_data['data']['status'] == 'success':
-            payment.status = 'Completed'
-            payment.updated_at = timezone.now()
-            payment.save()
-            # Send confirmation email (Celery recommended for production)
-            send_mail(
-                'Payment Confirmation',
-                f'Your payment for booking {payment.booking_reference} was successful.',
-                settings.DEFAULT_FROM_EMAIL,
-                [request.POST.get('email')],
-                fail_silently=True,
+            return Response(
+                {'error': 'Payment not found'},
+                status=status.HTTP_404_NOT_FOUND
             )
-            return JsonResponse({'status': 'Completed'})
-        else:
-            payment.status = 'Failed'
-            payment.updated_at = timezone.now()
-            payment.save()
-            return JsonResponse({'status': 'Failed', 'message': resp_data.get('message', 'Verification failed')}, status=400)
-    return JsonResponse({'error': 'Invalid request method'}, status=405)
+
+        headers = {'Authorization': f'Bearer {CHAPA_SECRET_KEY}'}
+
+        try:
+            response = requests.get(f'{CHAPA_BASE_URL}/verify/{payment.transaction_id}', headers=headers)
+            resp_data = response.json()
+
+            if resp_data.get('status') == 'success' and resp_data['data']['status'] == 'success':
+                payment.status = 'Completed'
+                payment.updated_at = timezone.now()
+                payment.save()
+                return Response({'status': 'Completed'}, status=status.HTTP_200_OK)
+            else:
+                payment.status = 'Failed'
+                payment.updated_at = timezone.now()
+                payment.save()
+                return Response(
+                    {'status': 'Failed', 'message': resp_data.get('message', 'Verification failed')},
+                    status=status.HTTP_400_BAD_REQUEST
+                )
+        except Exception as e:
+            return Response(
+                {'error': f'Payment verification failed: {str(e)}'},
+                status=status.HTTP_500_INTERNAL_SERVER_ERROR
+            )
